@@ -1,0 +1,435 @@
+import os
+import json
+import numpy as np
+import torch, gc
+import matplotlib.pyplot as plt
+
+device = torch.device("cuda:0")
+torch.cuda.set_device(device)
+print(f"torch.cuda.device_count(): {torch.cuda.device_count()}")
+print(f"torch.cuda.get_device_name(): {torch.cuda.get_device_name(0)}")
+
+from model.pointtransformer.pointtransformerlayer import pt_repro as Model
+from types import SimpleNamespace
+
+c = 3
+k = 3
+B = 16
+
+# Mean Configuration
+cfg_mean = SimpleNamespace()
+cfg_mean.num_encoder = 6
+cfg_mean.planes = [16, 32, 64, 128, 256, 512]
+cfg_mean.blocks = [2, 3, 4, 5, 6, 3]
+cfg_mean.share_planes = 8
+cfg_mean.stride = [1, 5, 4, 4, 4, 4]
+cfg_mean.nsample = [8, 8, 16, 16, 16, 16]
+
+# Body Configuration
+cfg_body = SimpleNamespace()
+cfg_body.num_encoder = 6
+cfg_body.planes = [16, 32, 64, 128, 256, 512]
+cfg_body.blocks = [2, 3, 4, 5, 6, 3]
+cfg_body.share_planes = 8
+cfg_body.stride = [1, 4, 4, 4, 4, 4]
+cfg_body.nsample = [8, 8, 16, 16, 16, 16]
+
+# Decoder Configuration
+cfg_decoder = SimpleNamespace()
+cfg_decoder.num_decoder = 6
+cfg_decoder.planes = cfg_body.planes[::-1]
+cfg_decoder.blocks = cfg_body.blocks[::-1]
+cfg_decoder.share_planes = cfg_body.share_planes
+cfg_decoder.nsample = cfg_body.nsample[::-1]
+
+print(cfg_mean)
+print(cfg_body)
+print(cfg_decoder)
+
+model = Model(cfg_mean, cfg_body, cfg_decoder, c=c, k=k)
+
+import argparse
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument("--training_list_file_path",type=str,required=True,default="",help="Training Set patient list file path")
+parser.add_argument("--testing_list_file_path",type=str,required=True,default="",help="Testing Set patient file path")
+parser.add_argument("--label_json_file_path",type=str,required=True,default="",help="JSON file path for label organs")
+parser.add_argument("--data_root",type=str,required=True,default="",help="Data root path (For loading point clouds)")
+parser.add_argument("--init_mean_shape_path",type=str,required=True,default="",help="Init mean shape file path")
+parser.add_argument("--conversion_path",type=str,required=True,default="",help="Conversion file path for affine transformations")
+parser.add_argument("--save_path", type=str, required=True, default="", help="Path to save results")
+parser.add_argument("--which_label",type=str,required=True,default="",help="Which label set to use")
+
+args = parser.parse_args()
+
+
+training_patient_list_file   = args.training_list_file_path
+test_patient_list_file       = args.testing_list_file_path
+
+# Load Patient Data
+training_data = {}
+train_patient_list = []
+with open(training_patient_list_file, "r") as f:
+	for line in f:
+		train_patient_list.append(line.strip()) 
+test_data = {}
+test_patient_list = []
+with open(test_patient_list_file, "r") as f:
+	for line in f:
+		test_patient_list.append(line.strip()) 
+		
+# Load Init Data
+label_data_root = args.label_json_file_path
+data_file = args.init_mean_shape_path
+if data_file is not None:
+	init_mean_data = np.load(data_file, allow_pickle=True)
+	init_mean = init_mean_data["mean_pc_np"]
+	init_mean_labels = init_mean_data["mean_label_np"]
+
+which_label = args.which_label
+with open(os.path.join(label_data_root, f"label_organs_{which_label}.json")) as f:
+    label_organs = json.load(f)
+	
+# Select the given labels for init mean
+keep = np.array([int(label) for label in label_organs.keys()])
+mask = np.isin(init_mean_labels, keep)
+init_mean_labels = init_mean_labels[mask]
+init_mean = init_mean[mask]
+
+data_root = args.data_root
+if os.path.exists(data_root):
+	loaded = np.load(data_root)
+	data = {}
+	for k in loaded.files:
+		main, sub = k.split("__")
+		data.setdefault(main, {})[sub] = loaded[k]
+		
+print(label_organs)
+
+N_in = 16384
+N_points = 4096
+N_classes = 5
+N_out = N_points * N_classes
+
+train_input_points = torch.zeros((len(train_patient_list), N_in, 3), dtype=torch.float32)
+train_target_points = torch.zeros((len(train_patient_list), N_out, 3), dtype=torch.float32)
+train_target_labels = torch.zeros((len(train_patient_list), N_out), dtype=torch.int64)
+
+for patient_id in train_patient_list:
+	
+	patient_data = data[patient_id]
+	patient_target_points = torch.zeros((N_out,3), dtype=torch.float32)
+	patient_target_labels = torch.zeros((N_out,), dtype=torch.int64)
+	
+	for idx, (label, organ) in enumerate(label_organs.items()):
+		patient_target_points[idx * N_points:(idx + 1) * N_points] = torch.from_numpy(patient_data[organ])
+		patient_target_labels[idx * N_points:(idx + 1) * N_points] = int(label)
+	
+	train_input_points[train_patient_list.index(patient_id)] = torch.from_numpy(patient_data['input_points'])
+	train_target_points[train_patient_list.index(patient_id)] = patient_target_points
+	train_target_labels[train_patient_list.index(patient_id)] = patient_target_labels
+	
+N_in = 16384
+N_points = 4096
+N_classes = 5
+N_out = N_points * N_classes
+
+test_input_points = torch.zeros((len(test_patient_list), N_in, 3), dtype=torch.float32)
+test_target_points = torch.zeros((len(test_patient_list), N_out, 3), dtype=torch.float32)
+test_target_labels = torch.zeros((len(test_patient_list), N_out), dtype=torch.int64)
+
+for patient_id in test_patient_list:
+	
+	patient_data = data[patient_id]
+	patient_target_points = torch.zeros((N_out,3), dtype=torch.float32)
+	patient_target_labels = torch.zeros((N_out,), dtype=torch.int64)
+	
+	for idx, (label, organ) in enumerate(label_organs.items()):
+		patient_target_points[idx * N_points:(idx + 1) * N_points] = torch.from_numpy(patient_data[organ])
+		patient_target_labels[idx * N_points:(idx + 1) * N_points] = int(label)
+	
+	test_input_points[test_patient_list.index(patient_id)] = torch.from_numpy(patient_data['input_points'])
+	test_target_points[test_patient_list.index(patient_id)] = patient_target_points
+	test_target_labels[test_patient_list.index(patient_id)] = patient_target_labels
+	
+conversion_path = args.conversion_path
+
+if os.path.exists(conversion_path):
+	conversion = np.load(conversion_path, allow_pickle=True)
+	
+from torch.utils.data import Dataset
+
+class NAKO_10k_All_Dataset(Dataset):
+	def __init__(self, input_points, output_points, output_labels, init_mean, init_labels, conversion, patient_ids, img_path):
+		
+		self.input_points = input_points
+		self.output_points = output_points
+		self.output_labels = output_labels
+		self.init_mean = init_mean
+		self.init_mean_labels = init_labels
+		self.conversion = conversion
+		self.patients = patient_ids
+
+		self.img_path_main = img_path
+	
+	def __len__(self):
+		return len(self.input_points)
+
+	def __getitem__(self, idx):
+
+		input_point_cloud = self.input_points[idx]
+		output_point_cloud = self.output_points[idx]
+		output_label = self.output_labels[idx]
+
+		# Patient Img Transform File
+		patient = self.patients[idx]
+		patient_path = os.path.join(self.img_path_main, patient, "wat.nii.gz")
+		transform = []
+		if patient in self.conversion:
+			transform.append(self.conversion[patient])
+		else:
+			raise ValueError(f"Patient {patient} not found in conversion data.")
+		
+		# Init Shape for the organ (noise added)
+		init_points = self.init_mean + np.random.normal(0, 0.001, self.init_mean.shape)
+		init_labels = self.init_mean_labels
+
+		# Convert to torch tensors if they are numpy arrays
+		if isinstance(init_points, np.ndarray):
+			init_points = torch.tensor(init_points, dtype=torch.float32)
+		elif isinstance(init_points, torch.Tensor):
+			init_points = init_points.float()
+			
+		if isinstance(init_labels, np.ndarray):
+			init_labels = torch.tensor(init_labels, dtype=torch.long)
+		elif isinstance(init_labels, torch.Tensor):
+			init_labels = init_labels.long()
+
+		if isinstance(input_point_cloud, np.ndarray):
+			input_point_cloud = torch.tensor(input_point_cloud, dtype=torch.float32)
+		elif isinstance(input_point_cloud, torch.Tensor):
+			input_point_cloud = input_point_cloud.float()
+
+		if isinstance(output_point_cloud, np.ndarray):
+			output_point_cloud = torch.tensor(output_point_cloud, dtype=torch.float32)
+		elif isinstance(output_point_cloud, torch.Tensor):
+			output_point_cloud = output_point_cloud.float()
+
+		if isinstance(output_label, np.ndarray):
+			output_label = torch.tensor(output_label, dtype=torch.long)
+		elif isinstance(output_label, torch.Tensor):
+			output_label = output_label.long()
+
+		return input_point_cloud, init_points, init_labels, output_point_cloud, output_label, transform, patient_path
+
+def collate_fn(batch):
+	body_coord, mean_coord, mean_labels, target_coord, target_label, transform_matrix, patient_path = list(zip(*batch))
+	body_offset, count = [], 0
+	for item in body_coord:
+		count += item.shape[0]
+		body_offset.append(count)
+	mean_offset, count = [], 0
+	for item in mean_coord:
+		count += item.shape[0]
+		mean_offset.append(count)
+	target_offset, count = [], 0
+	for item in target_coord:
+		count += item.shape[0]
+		target_offset.append(count)
+				
+	return torch.cat(body_coord), torch.IntTensor(body_offset), torch.cat(mean_coord), torch.cat(mean_labels), torch.IntTensor(mean_offset), torch.cat(target_coord), torch.cat(target_label), torch.IntTensor(target_offset), transform_matrix, patient_path
+
+save_path = args.save_path
+
+if not os.path.exists(save_path):
+	os.makedirs(save_path, exist_ok=True)
+
+model_save_path = os.path.join(save_path, "models")
+os.makedirs(model_save_path, exist_ok=True)
+csv_save_path = os.path.join(save_path, "csv")
+os.makedirs(csv_save_path, exist_ok=True)
+fig_save_path = os.path.join(save_path, "figures")
+os.makedirs(fig_save_path, exist_ok=True)
+
+train_data = NAKO_10k_All_Dataset(input_points=train_input_points,	output_points=train_target_points,	output_labels=train_target_labels,	init_mean=init_mean,	init_labels=init_mean_labels,	conversion=conversion,	patient_ids=train_patient_list,	img_path="../../../../eytankats/data/nako_10k/images_mri_stitched/")
+train_loader = torch.utils.data.DataLoader(train_data, batch_size=B, shuffle=True, drop_last=True, collate_fn=collate_fn)
+
+test_data = NAKO_10k_All_Dataset(input_points=test_input_points,	output_points=test_target_points,	output_labels=test_target_labels,	init_mean=init_mean,	init_labels=init_mean_labels,	conversion=conversion,	patient_ids=test_patient_list,	img_path="../../../../eytankats/data/nako_10k/images_mri_stitched/")
+test_loader = torch.utils.data.DataLoader(test_data, batch_size=B, shuffle=False, drop_last=True, collate_fn=collate_fn)
+
+from util.chamfer_loss import calc_chamfer_stacked_objectwise as criterion
+from torch.optim import Adam
+from torch.optim.lr_scheduler import MultiStepLR
+
+optimizer = Adam(model.parameters(), lr=1e-3)
+scheduler = MultiStepLR(optimizer, milestones=[25, 50, 75], gamma=0.3)
+
+from tqdm import tqdm
+
+best_loss = float("inf")
+total_epoch = 100
+loss_epoch = np.zeros((total_epoch,), dtype=np.float32)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+model.train()
+early_stop_counter = 0
+for epoch in range(1,total_epoch+1):
+	print(f"Epoch {epoch}/{total_epoch}")
+	avg_loss = 0.0
+	for i, (body_coord, body_offset, mean_coord, mean_labels, mean_offset, target_coord, target_labels, target_offset, transform_matrix, patient_path) in enumerate(tqdm(train_loader)): 
+		body_coord, body_offset = body_coord.to(device), body_offset.to(device)
+		mean_coord, mean_labels, mean_offset = mean_coord.to(device), mean_labels.to(device), mean_offset.to(device)
+		target_coord, target_labels = target_coord.to(device), target_labels.to(device)
+		
+		output_coord = model([body_coord, body_coord, body_offset], [mean_coord, mean_coord, mean_offset])
+
+		loss = criterion(output_coord, target_coord, mean_labels, target_labels, B)
+		optimizer.zero_grad()
+		loss.backward()
+		optimizer.step()
+		
+		avg_loss += loss.item()
+	
+	avg_loss /= len(train_loader)
+	print(f"Avg Loss - {avg_loss:.6f}")
+	loss_epoch[epoch-1] = avg_loss
+	if avg_loss <= best_loss:
+		print("New best result")
+		best_loss = avg_loss
+		torch.save(model.state_dict(), f"{model_save_path}/model_weights_best.pth")
+		early_stop_counter = 0
+	else:
+		early_stop_counter += 1
+		print(f"Best loss remains - {best_loss:.6f} - Early stop counter: {early_stop_counter}")
+	
+	if early_stop_counter >= 6:
+		print("Early stopping triggered.")
+		break
+		
+	scheduler.step()
+
+torch.save(model.state_dict(), f"{model_save_path}/model_weights_last.pth")
+
+fig = plt.figure(figsize=(8,8))
+ax = fig.add_subplot(111)
+ax.plot(loss_epoch)
+ax.set_title("Running Loss over Epoch")
+ax.set_xlabel("Epoch")
+ax.set_ylabel("CD Loss")
+plt.savefig(f"{fig_save_path}/Running Loss")
+
+import pandas as pd
+from util.evaluation_functions import evaluate
+
+gc.collect()
+torch.cuda.empty_cache()
+
+model.load_state_dict(torch.load(f"{model_save_path}/model_weights_best.pth"))
+
+all_metrics = {"cd": {}, "hd95": {}, "max_width": {}, "min_width": {}, "max_depth": {}, "min_depth": {}, "max_height": {}, "min_height": {}}
+for metric, metric_results in all_metrics.items():
+	for label, organ in label_organs.items():
+		metric_results[organ] = 0.0
+
+cd, hd95 = 0.0, 0.0
+model.eval()
+    
+with torch.no_grad():
+	for i, (body_coord, body_offset, mean_coord, mean_labels, mean_offset, target_coord, target_labels, target_offset, transform_matrix, patient_path) in enumerate(tqdm(test_loader)): 
+		body_coord, body_offset = body_coord.to(device), body_offset.to(device)
+		mean_coord, mean_labels, mean_offset = mean_coord.to(device), mean_labels.to(device), mean_offset.to(device)
+		target_coord, target_labels = target_coord.to(device), target_labels.to(device)
+
+		output_coord = model([body_coord, body_coord, body_offset], [mean_coord, mean_coord, mean_offset])
+			
+		results = evaluate(output_coord.detach(), target_coord, mean_labels, target_labels, batch_size=B, affine=transform_matrix[0], device=device)
+
+		cd += results["total_cd"]
+		hd95 += results["total_hd95"]
+
+		for idx, (label, organ) in enumerate(label_organs.items()):
+			all_metrics["cd"][organ] += results["per_organ_cd"][idx]
+			all_metrics["hd95"][organ] += results["per_organ_hd95"][idx]
+			all_metrics["max_width"][organ] += results["max_error_mm"][idx, 0]
+			all_metrics["max_depth"][organ] += results["max_error_mm"][idx, 1]
+			all_metrics["max_height"][organ] += results["max_error_mm"][idx, 2]
+			all_metrics["min_width"][organ] += results["min_error_mm"][idx, 0]
+			all_metrics["min_depth"][organ] += results["min_error_mm"][idx, 1]
+			all_metrics["min_height"][organ] += results["min_error_mm"][idx, 2]
+
+	cd /= len(test_loader)
+	hd95 /= len(test_loader)
+
+	for metric, metric_results in all_metrics.items():
+		for label, organ in label_organs.items():
+			metric_results[organ] /= len(test_loader)
+
+	all_metrics = {metric: {organ: value.item() for organ, value in metric_results.items()} for metric, metric_results in all_metrics.items()}
+	metrics_df = pd.DataFrame(all_metrics)
+	metrics_df.to_csv(f"{csv_save_path}/trained_vs_target_{which_label}.csv")
+
+	import random
+
+	for r in range(len(mean_offset)-1):
+
+		offset_b, offset_e = mean_offset[r], mean_offset[r+1]
+		mean_coord_np = mean_coord[offset_b:offset_e].detach().cpu().numpy()
+		mean_label_np = mean_labels[offset_b:offset_e].detach().cpu().numpy()
+		target_coord_np = target_coord[offset_b:offset_e].detach().cpu().numpy()
+		target_labels_np = target_labels[offset_b:offset_e].detach().cpu().numpy()
+		output_coord_np = output_coord[offset_b:offset_e].detach().cpu().numpy()
+
+		fig = plt.figure(figsize=(8,8))
+		ax = fig.add_subplot(1,3,1, projection='3d')
+		ax.scatter(mean_coord_np[:,2], mean_coord_np[:,1], mean_coord_np[:, 0], c=mean_label_np, cmap='plasma')
+		ax.set_xlim([-1,1])
+		ax.set_ylim([-1,1])
+		ax.set_zlim([-1,1])
+		ax.set_title("Mean Coordinates")
+		ax = fig.add_subplot(1,3,2, projection='3d')
+		ax.scatter(output_coord_np[:,2], output_coord_np[:,1], output_coord_np[:, 0], c=mean_label_np, cmap='plasma')
+		ax.set_xlim([-1,1])
+		ax.set_ylim([-1,1])
+		ax.set_zlim([-1,1])
+		ax.set_title("Output Coordinates")
+		ax = fig.add_subplot(1,3,3, projection='3d')
+		ax.scatter(target_coord_np[:,2], target_coord_np[:,1], target_coord_np[:, 0], c=target_labels_np, cmap='plasma')
+		ax.set_xlim([-1,1])
+		ax.set_ylim([-1,1])
+		ax.set_zlim([-1,1])
+		ax.set_title("Target Coordinates")
+
+		plt.savefig(f"{fig_save_path}/Output Results - {r+1}")
+
+	
+for i, (body_coord, body_offset, mean_coord, mean_labels, mean_offset, target_coord, target_labels, target_offset, transform_matrix, patient_path) in enumerate(tqdm(test_loader)): 
+	body_coord, body_offset = body_coord.to(device), body_offset.to(device)
+	mean_coord, mean_labels, mean_offset = mean_coord.to(device), mean_labels.to(device), mean_offset.to(device)
+	target_coord, target_labels = target_coord.to(device), target_labels.to(device)
+		
+	results = evaluate(mean_coord, target_coord, mean_labels, target_labels, batch_size=B, affine=transform_matrix[0], device=device)
+
+	cd += results["total_cd"]
+	hd95 += results["total_hd95"]
+
+	for idx, (label, organ) in enumerate(label_organs.items()):
+		all_metrics["cd"][organ] += results["per_organ_cd"][idx]
+		all_metrics["hd95"][organ] += results["per_organ_hd95"][idx]
+		all_metrics["max_width"][organ] += results["max_error_mm"][idx, 0]
+		all_metrics["max_depth"][organ] += results["max_error_mm"][idx, 1]
+		all_metrics["max_height"][organ] += results["max_error_mm"][idx, 2]
+		all_metrics["min_width"][organ] += results["min_error_mm"][idx, 0]
+		all_metrics["min_depth"][organ] += results["min_error_mm"][idx, 1]
+		all_metrics["min_height"][organ] += results["min_error_mm"][idx, 2]
+
+cd /= len(test_loader)
+hd95 /= len(test_loader)
+
+for metric, metric_results in all_metrics.items():
+	for label, organ in label_organs.items():
+		metric_results[organ] /= len(test_loader)
+
+all_metrics = {metric: {organ: value.item() for organ, value in metric_results.items()} for metric, metric_results in all_metrics.items()}
+metrics_df = pd.DataFrame(all_metrics)
+metrics_df.to_csv(f"{csv_save_path}/init_vs_target_{which_label}.csv")
