@@ -28,3 +28,5 @@ The decoder reconstructs the internal organs by merging features from both encod
 • **Upsampling:** It utilizes Interpolation layers to increase point density,.
 • **Skip Connections:** Information is passed directly from encoder stages to corresponding decoder stages to preserve spatial detail.
 • **Refinement:** Similar to the encoder, the decoder uses Transformer and Linear layers to refine the coordinates of the predicted internal structures,.
+
+![](figures/model.png)
