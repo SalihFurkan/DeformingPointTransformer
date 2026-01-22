@@ -27,6 +27,6 @@ The architecture features two distinct encoding branches that process the Body S
 The decoder reconstructs the internal organs by merging features from both encoder branches.
 • **Upsampling:** It utilizes Interpolation layers to increase point density,.
 • **Skip Connections:** Information is passed directly from encoder stages to corresponding decoder stages to preserve spatial detail.
-• **Refinement:** Similar to the encoder, the decoder uses Transformer and Linear layers to refine the coordinates of the predicted internal structures,.
+• **Refinement:** Similar to the encoder, the decoder uses Transformer and Linear layers to refine the coordinates of the predicted internal structures.
 
-![](figures/model.png)
+![](figures/model_arch.drawio-2.png)
